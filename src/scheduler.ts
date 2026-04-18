@@ -21,7 +21,9 @@ export function startScheduler(
   cron.schedule(
     expression,
     () => {
-      void task();
+      void task().catch((err) => {
+        log.error('Scheduled backup task rejected', { error: String(err) });
+      });
     },
     { timezone },
   );

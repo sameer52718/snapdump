@@ -1,7 +1,7 @@
 {
   "name": "database-backup-service",
   "version": "1.0.0",
-  "description": "Production database backups to Google Drive (MongoDB, PostgreSQL, MySQL)",
+  "description": "Production database backups to AWS S3 (MongoDB, PostgreSQL, MySQL)",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -18,14 +18,16 @@
     "mongodb",
     "postgresql",
     "mysql",
-    "google-drive"
+    "aws",
+    "s3"
   ],
   "license": "MIT",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.758.0",
+    "@aws-sdk/lib-storage": "^3.758.0",
     "archiver": "^7.0.1",
     "cron-parser": "^4.9.0",
     "dotenv": "^16.4.5",
-    "googleapis": "^144.0.0",
     "node-cron": "^3.0.3"
   },
   "devDependencies": {

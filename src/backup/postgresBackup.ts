@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { runCmd } from '../utils/shell.js';
+import { pathForCliArg } from '../utils/cliPaths.js';
 import type { BackupArtifacts } from './types.js';
 
 /**
@@ -7,7 +8,7 @@ import type { BackupArtifacts } from './types.js';
  * Large objects are included by default in pg_dump; --blobs kept explicit for clarity.
  */
 export async function backupPostgres(workDir: string, databaseUrl: string): Promise<BackupArtifacts> {
-  const outFile = path.join(workDir, 'postgres.dump');
+  const outFile = pathForCliArg(path.join(workDir, 'postgres.dump'));
   await runCmd('pg_dump', [
     '--format=custom',
     '--blobs',

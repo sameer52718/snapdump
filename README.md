@@ -1,6 +1,6 @@
 # Database backup service
 
-Production-oriented Node.js (TypeScript) worker that runs **native CLI backups** (`mongodump`, `pg_dump`, `mysqldump`), streams them into a **`.zip`**, and uploads to **Google Drive** using a **service account**. Scheduling is **daily** via `node-cron` using `BACKUP_TIME` and `TIMEZONE`.
+Production-oriented Node.js (TypeScript) worker that runs **native CLI backups** (`mongodump`, `pg_dump`, `mysqldump`), streams them into a **`.zip`**, and uploads to **Amazon S3**. Scheduling is **daily** via `node-cron` using `BACKUP_TIME` and `TIMEZONE`.
 
 ## Prerequisites
 
@@ -9,7 +9,7 @@ Production-oriented Node.js (TypeScript) worker that runs **native CLI backups**
   - **MongoDB**: `mongodump`
   - **PostgreSQL**: `pg_dump`
   - **MySQL/MariaDB**: `mysqldump`
-- A Google Cloud **service account** with the Drive API enabled and a JSON key file (`credentials.json` or path via env).
+- **AWS** access to an **S3 bucket** (IAM user keys, instance/profile credentials, or environment-specific auth the AWS SDK supports).
 
 ## Quick start
 
@@ -19,13 +19,11 @@ Production-oriented Node.js (TypeScript) worker that runs **native CLI backups**
 npm install
 ```
 
-2. Create a `.env` file (see variables below).
+2. Create an S3 bucket (any region you prefer).
 
-3. Place your service account JSON key at `./credentials.json` **or** set `GOOGLE_SERVICE_ACCOUNT_KEY_PATH`.
+3. Create a `.env` file (see [Environment variables](#environment-variables)). At minimum you need `DATABASE_URL`, `AWS_REGION` (or `AWS_DEFAULT_REGION`), `S3_BUCKET`, and credentials unless you run on AWS with an **IAM role** (EC2, ECS, Lambda, etc.).
 
-4. **Share a Drive folder** with the service account email (shown in the JSON as `client_email`). Put that folder’s ID into `GOOGLE_DRIVE_PARENT_FOLDER_ID`. The service will create `BASE_BACKUP_FOLDER/YYYY/MM/DD/` under it.
-
-5. Build and run:
+4. Build and run:
 
 ```bash
 npm run build
@@ -40,44 +38,126 @@ npm run dev
 
 ## Environment variables
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `DATABASE_URL` | **Yes** | — | Auto-detects engine from scheme (`mongodb`, `mongodb+srv`, `postgres`, `postgresql`, `mysql`, `mariadb`). |
-| `BACKUP_TIME` | No | `02:00` | Local time `HH:mm` (24h) for the daily run. |
-| `TIMEZONE` | No | `Asia/Karachi` | IANA timezone for cron and `Y/M/D` folder paths. |
-| `BASE_BACKUP_FOLDER` | No | `MyAppBackups` | Top-level folder name inside Drive. |
-| `KEEP_LOCAL_COPY` | No | `false` | If `true`, keeps the local zip after upload. |
-| `GOOGLE_SERVICE_ACCOUNT_KEY_PATH` | No | `./credentials.json` | Path to service account JSON. |
-| `GOOGLE_APPLICATION_CREDENTIALS` | No | — | Alternative to the above (standard Google env). |
-| `GOOGLE_DRIVE_PARENT_FOLDER_ID` | **Recommended** | — | Drive folder ID shared with the service account; backups are created under this folder. If omitted, the API uses `'root'` (the service account’s own Drive), which is often **not** what you want in production. |
-| `BACKUP_MAX_RETRIES` | No | `2` | Minimum `2` enforced: retries after the first failure (each operation gets **up to** `BACKUP_MAX_RETRIES + 1` attempts). |
+### Required
 
-## Drive layout
+| Variable | Description |
+| --- | --- |
+| `DATABASE_URL` | Auto-detects engine from scheme (`mongodb`, `mongodb+srv`, `postgres`, `postgresql`, `mysql`, `mariadb`). |
+| `S3_BUCKET` | Target bucket name (no `s3://` prefix). |
+| `AWS_REGION` **or** `AWS_DEFAULT_REGION` | Region for the S3 client (e.g. `ap-south-1`, `us-east-1`). |
+
+### AWS credentials (pick one approach)
+
+The app uses the **default AWS SDK credential chain**. You do **not** need all of these; use what matches your environment.
+
+| Variable | When to use |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID` | Long-term or IAM user access key (with `AWS_SECRET_ACCESS_KEY`). |
+| `AWS_SECRET_ACCESS_KEY` | Pair with `AWS_ACCESS_KEY_ID`. |
+| `AWS_SESSION_TOKEN` | Temporary credentials (e.g. assumed role). |
+| `AWS_PROFILE` | Shared credentials file profile name (local dev). |
+| *(none)* | On **EC2 / ECS / Lambda**, prefer an **IAM role** attached to the workload. |
+
+For **typical backups under 5 GiB**, the app uses one **`s3:PutObject`** request per zip, so IAM can be as small as **`s3:PutObject`** on `arn:aws:s3:::YOUR_BUCKET/*`. **Larger** zips use multipart upload and need the extra actions listed in [Troubleshooting](#troubleshooting-s3-access-denied).
+
+### Optional
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `BACKUP_TIME` | `02:00` | Daily run time `HH:mm` (24h), interpreted in `TIMEZONE`. |
+| `TIMEZONE` | `Asia/Karachi` | IANA timezone for cron and for `Y/M/D` in the object key. |
+| `BASE_BACKUP_FOLDER` | `MyAppBackups` | First segment of the S3 key (logical “folder”). |
+| `KEEP_LOCAL_COPY` | `false` | If `true`, keeps the local zip after upload. |
+| `S3_ENDPOINT` | — | Custom endpoint (e.g. **LocalStack**, **MinIO**). |
+| `S3_FORCE_PATH_STYLE` | `false` | Set `true` for many S3-compatible stores (e.g. MinIO). |
+| `S3_STORAGE_CLASS` | — | e.g. `STANDARD_IA`, `GLACIER_IR` (must be valid for your bucket). |
+| `BACKUP_MAX_RETRIES` | `2` | Minimum `2` enforced: retries after the first failure (each step gets up to `BACKUP_MAX_RETRIES + 1` attempts). |
+
+## S3 object layout
 
 With `BASE_BACKUP_FOLDER=MyAppBackups`, `TIMEZONE=Asia/Karachi`, and run date 18 Apr 2026:
 
 ```text
-MyAppBackups/2026/04/18/backup-<unixTimestamp>.zip
+s3://YOUR_BUCKET/MyAppBackups/2026/04/18/backup-<unixTimestamp>.zip
 ```
 
-Example: `MyAppBackups/2026/04/18/backup-1713423434.zip`.
+Example object key: `MyAppBackups/2026/04/18/backup-1713423434.zip`.
+
+S3 has no real folders; `/` is a **key prefix** for organization in the console.
 
 ## Backup behavior (CLI)
 
-- **MongoDB**: `mongodump --uri <DATABASE_URL> --archive <file>` (full archive; restore with `mongorestore --archive`).
-- **PostgreSQL**: `pg_dump` in **custom** format (`-Fc` via `--format=custom`) with `--blobs`, `--no-owner`, `--no-acl` for portable dumps; restore with `pg_restore`.
-- **MySQL**: `mysqldump` with `--single-transaction`, `--routines`, `--triggers`, `--events`, `--hex-blob`, `--default-character-set=utf8mb4`, `--set-gtid-purged=OFF`, and `--column-statistics=0` (common MySQL 8 compatibility flag). Credentials are passed via a temporary `--defaults-extra-file` to avoid putting the password on the process command line.
+- **MongoDB**: `mongodump --uri <DATABASE_URL> --archive <file>` (restore with `mongorestore --archive`).
+- **PostgreSQL**: `pg_dump` **custom** format with `--blobs`, `--no-owner`, `--no-acl`; restore with `pg_restore`.
+- **MySQL**: `mysqldump` with `--single-transaction`, `--routines`, `--triggers`, `--events`, and related production-oriented flags; credentials via a temporary `--defaults-extra-file`.
+
+Upload uses **`@aws-sdk/lib-storage`** so the zip is streamed (multipart for larger files) without loading the whole archive into memory.
+
+## Troubleshooting: S3 Access Denied
+
+The SDK returns **Access Denied** when AWS rejects the request. Common causes:
+
+1. **IAM** — The identity needs **multipart** upload actions on the bucket, not only console access.
+2. **Region** — `AWS_REGION` / `AWS_DEFAULT_REGION` must match the **bucket** region.
+3. **Bucket policy** — Deny rules, IP conditions, or required encryption/KMS.
+4. **SSE-KMS** — Bucket default encryption with a CMK may require **`kms:Decrypt`**, **`kms:GenerateDataKey`**, and related permissions on that key.
+
+### Minimal IAM policy (backups **under 5 GiB** — most databases)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackupPutObject",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
+    }
+  ]
+}
+```
+
+### Full policy (multipart — backups **5 GiB or larger**)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackupWritesMultipart",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
+    },
+    {
+      "Sid": "BackupListMultipartOnBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucketMultipartUploads"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET"
+    }
+  ]
+}
+```
+
+If it still fails, temporarily use a broad policy (e.g. **`AmazonS3FullAccess`**) to confirm the issue is IAM, then tighten.
+
+Error logs from this app include **bucket**, **key**, and **requestId** when S3 returns an error.
 
 ## Security notes
 
-- Treat `credentials.json` and `.env` as secrets; they are listed in `.gitignore`.
-- Prefer a dedicated **shared Drive folder** (`GOOGLE_DRIVE_PARENT_FOLDER_ID`) instead of relying on the service account root.
-- The service account must have access to the parent folder you configure.
+- Keep `.env` and any credential files out of git (see `.gitignore`).
+- Prefer **IAM roles** on AWS over long-lived keys where possible.
+- Restrict IAM to the bucket (or prefix) you use for backups.
 
 ## Operational notes
 
-- Run **one instance** per backup configuration. Concurrent runs can race on Drive folder creation (unlikely to corrupt data, but can create duplicate empty folders if names collide exactly at the same time).
-- On failure **after** a zip is produced, the local zip may be **kept** to help debugging (see logs for the path).
+- Run **one instance** per backup configuration if you need strictly ordered runs.
+- On failure **after** a zip is produced, the local zip may be **kept** for debugging (see logs).
 
 ## Project layout
 
@@ -87,18 +167,17 @@ src/
   scheduler.ts          # node-cron wiring + next-run logging
   config.ts             # Env loading / validation helpers
   backup/
-    detectDb.ts         # URL scheme detection
+    detectDb.ts
     mongoBackup.ts
     postgresBackup.ts
     mysqlBackup.ts
     runBackup.ts        # Temp dirs, zip, cleanup
-  drive/
-    client.ts
-    folders.ts          # Idempotent folder path creation
-    upload.ts
+  s3/
+    upload.ts           # S3 client, key builder, streaming upload
   services/
     backupJob.ts        # End-to-end job with retries
   utils/
+    cliPaths.ts
     cronFromTime.ts
     dateParts.ts
     logger.ts

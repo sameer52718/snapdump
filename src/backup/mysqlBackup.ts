@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { runCmd } from '../utils/shell.js';
+import { pathForCliArg } from '../utils/cliPaths.js';
 import type { BackupArtifacts } from './types.js';
 
 interface MysqlConn {
@@ -45,8 +46,8 @@ async function writeDefaultsExtraFile(workDir: string, conn: MysqlConn): Promise
  */
 export async function backupMysql(workDir: string, databaseUrl: string): Promise<BackupArtifacts> {
   const conn = parseMysqlUrl(databaseUrl);
-  const cnfPath = await writeDefaultsExtraFile(workDir, conn);
-  const outFile = path.join(workDir, 'mysql.sql');
+  const cnfPath = pathForCliArg(await writeDefaultsExtraFile(workDir, conn));
+  const outFile = pathForCliArg(path.join(workDir, 'mysql.sql'));
 
   const args = [
     `--defaults-extra-file=${cnfPath}`,
