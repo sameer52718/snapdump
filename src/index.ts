@@ -30,9 +30,9 @@ function main(): void {
     s3Bucket: config.s3Bucket,
   });
 
-   runScheduledBackup(config);
   startScheduler(config.timezone, config.backupTime, async () => {
     try {
+      await runScheduledBackup(config);
     } catch {
       // Errors are logged inside the job; keep the scheduler process alive.
     }
