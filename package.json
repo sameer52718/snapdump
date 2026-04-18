@@ -1,5 +1,5 @@
 {
-  "name": "database-backup-service",
+  "name": "snapdump",
   "version": "1.0.0",
   "description": "Production database backups to AWS S3 (MongoDB, PostgreSQL, MySQL)",
   "type": "module",
