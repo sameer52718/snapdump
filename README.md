@@ -1,108 +1,110 @@
-# Database backup service
+# Database Backup Service
 
-Production-oriented Node.js (TypeScript) worker that runs **native CLI backups** (`mongodump`, `pg_dump`, `mysqldump`), streams them into a **`.zip`**, and uploads to **Amazon S3**. Scheduling is **daily** via `node-cron` using `BACKUP_TIME` and `TIMEZONE`.
+Automated **daily database backups** for **MongoDB**, **PostgreSQL**, and **MySQL**. The service detects the engine from `DATABASE_URL`, runs the official CLI tools (`mongodump`, `pg_dump`, `mysqldump`), compresses the result into a **ZIP** (streaming, low memory), and uploads to **Amazon S3** with retries and structured logging.
 
-## Prerequisites
+[![Node.js Version](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-- **Node.js 18+**
-- Database client tools on `PATH` for your engine:
-  - **MongoDB**: `mongodump`
-  - **PostgreSQL**: `pg_dump`
-  - **MySQL/MariaDB**: `mysqldump`
-- **AWS** access to an **S3 bucket** (IAM user keys, instance/profile credentials, or environment-specific auth the AWS SDK supports).
+---
 
-## Quick start
+## Table of contents
 
-1. Install dependencies:
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Setup guide](#setup-guide)
+  - [1. Clone and install](#1-clone-and-install)
+  - [2. Install database CLI tools](#2-install-database-cli-tools)
+  - [3. Create an S3 bucket](#3-create-an-s3-bucket)
+  - [4. Create an IAM identity and policy](#4-create-an-iam-identity-and-policy)
+  - [5. Configure environment variables](#5-configure-environment-variables)
+  - [6. Build and run](#6-build-and-run)
+- [Environment reference](#environment-reference)
+- [`DATABASE_URL` examples](#database_url-examples)
+- [S3 object layout](#s3-object-layout)
+- [Backup and restore](#backup-and-restore)
+- [Running in production](#running-in-production)
+- [Troubleshooting](#troubleshooting)
+- [Security](#security)
+- [Project structure](#project-structure)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Features
+
+- **Auto-detect database type** from `DATABASE_URL` (`mongodb`, `mongodb+srv`, `postgres`, `postgresql`, `mysql`, `mariadb`).
+- **Production-oriented CLI flags** (e.g. PostgreSQL custom format, MySQL `--single-transaction` and routines/triggers).
+- **ZIP via streaming** (`archiver`); temp artifacts cleaned up after success.
+- **S3 upload**: single `PutObject` for archives **under 5 GiB** (minimal IAM: `s3:PutObject`); **multipart** for larger files.
+- **Daily schedule** with `node-cron`, timezone-aware (`TIMEZONE`), next-run logging via `cron-parser`.
+- **Retries** on backup and upload steps (configurable minimum retries).
+- **TypeScript**, ESM, modular layout.
+
+---
+
+## How it works
+
+1. On each scheduled run, `DATABASE_URL` is validated and the engine is selected.
+2. A temporary working directory is created; the matching dump command writes files there.
+3. Dump output is zipped to a temp `.zip` path.
+4. The ZIP is uploaded to S3 at  
+   `{BASE_BACKUP_FOLDER}/{YYYY}/{MM}/{DD}/backup-{unixTimestamp}.zip`.
+5. Unless `KEEP_LOCAL_COPY=true`, the local zip is deleted after a successful upload.
+
+The process stays alive and runs **once per day** at `BACKUP_TIME` in `TIMEZONE`.
+
+---
+
+## Requirements
+
+| Component | Notes |
+|-----------|--------|
+| **Node.js** | **18+** (see `engines` in `package.json`). |
+| **Database tools** | The matching tool must be on your **`PATH`**: `mongodump`, `pg_dump`, or `mysqldump`. |
+| **AWS** | An S3 **bucket** and an identity (IAM user/role) allowed to **`s3:PutObject`** (and multipart actions if backups can exceed **5 GiB**). |
+| **Network** | Outbound access to your database and to **AWS S3** (or your S3-compatible endpoint). |
+
+---
+
+## Setup guide
+
+### 1. Clone and install
 
 ```bash
+git clone https://github.com/YOUR_USERNAME/database-backup-script.git
+cd database-backup-script
 npm install
 ```
 
-2. Create an S3 bucket (any region you prefer).
+### 2. Install database CLI tools
 
-3. Create a `.env` file (see [Environment variables](#environment-variables)). At minimum you need `DATABASE_URL`, `AWS_REGION` (or `AWS_DEFAULT_REGION`), `S3_BUCKET`, and credentials unless you run on AWS with an **IAM role** (EC2, ECS, Lambda, etc.).
+Install the tools for **your** database engine and ensure they work in a terminal:
 
-4. Build and run:
+| Engine | Tool | Typical install |
+|--------|------|-----------------|
+| MongoDB | `mongodump` | [MongoDB Database Tools](https://www.mongodb.com/docs/database-tools/) |
+| PostgreSQL | `pg_dump` | PostgreSQL client packages (`postgresql-client`, etc.) |
+| MySQL / MariaDB | `mysqldump` | MySQL / MariaDB client packages |
 
-```bash
-npm run build
-npm start
-```
+**Windows:** add the `bin` folder of each tool to your **PATH**, then open a **new** terminal and run `mongodump --version` (or `pg_dump --version`, `mysqldump --version`).
 
-Development (watch mode):
+### 3. Create an S3 bucket
 
-```bash
-npm run dev
-```
+1. Open **AWS Console → S3 → Create bucket**.
+2. Choose a **bucket name** (globally unique) and a **Region** (e.g. `ap-south-1`, `eu-west-1`, `us-east-1`).
+3. Note the **region** — you must set `AWS_REGION` (or `AWS_DEFAULT_REGION`) to **the same region** as the bucket.
 
-## Environment variables
+Optional: enable **default encryption** (SSE-S3 or SSE-KMS). If you use **SSE-KMS**, your IAM identity may need extra **KMS** permissions (see [Troubleshooting](#troubleshooting)).
 
-### Required
+### 4. Create an IAM identity and policy
 
-| Variable | Description |
-| --- | --- |
-| `DATABASE_URL` | Auto-detects engine from scheme (`mongodb`, `mongodb+srv`, `postgres`, `postgresql`, `mysql`, `mariadb`). |
-| `S3_BUCKET` | Target bucket name (no `s3://` prefix). |
-| `AWS_REGION` **or** `AWS_DEFAULT_REGION` | Region for the S3 client (e.g. `ap-south-1`, `us-east-1`). |
+**Recommended for servers:** attach an **IAM role** to EC2 / ECS / Lambda and **do not** put long-lived keys in `.env`.
 
-### AWS credentials (pick one approach)
+**For local or simple setups:** create an **IAM user** with **programmatic access**, then attach an **inline** or **customer managed** policy.
 
-The app uses the **default AWS SDK credential chain**. You do **not** need all of these; use what matches your environment.
-
-| Variable | When to use |
-| --- | --- |
-| `AWS_ACCESS_KEY_ID` | Long-term or IAM user access key (with `AWS_SECRET_ACCESS_KEY`). |
-| `AWS_SECRET_ACCESS_KEY` | Pair with `AWS_ACCESS_KEY_ID`. |
-| `AWS_SESSION_TOKEN` | Temporary credentials (e.g. assumed role). |
-| `AWS_PROFILE` | Shared credentials file profile name (local dev). |
-| *(none)* | On **EC2 / ECS / Lambda**, prefer an **IAM role** attached to the workload. |
-
-For **typical backups under 5 GiB**, the app uses one **`s3:PutObject`** request per zip, so IAM can be as small as **`s3:PutObject`** on `arn:aws:s3:::YOUR_BUCKET/*`. **Larger** zips use multipart upload and need the extra actions listed in [Troubleshooting](#troubleshooting-s3-access-denied).
-
-### Optional
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `BACKUP_TIME` | `02:00` | Daily run time `HH:mm` (24h), interpreted in `TIMEZONE`. |
-| `TIMEZONE` | `Asia/Karachi` | IANA timezone for cron and for `Y/M/D` in the object key. |
-| `BASE_BACKUP_FOLDER` | `MyAppBackups` | First segment of the S3 key (logical “folder”). |
-| `KEEP_LOCAL_COPY` | `false` | If `true`, keeps the local zip after upload. |
-| `S3_ENDPOINT` | — | Custom endpoint (e.g. **LocalStack**, **MinIO**). |
-| `S3_FORCE_PATH_STYLE` | `false` | Set `true` for many S3-compatible stores (e.g. MinIO). |
-| `S3_STORAGE_CLASS` | — | e.g. `STANDARD_IA`, `GLACIER_IR` (must be valid for your bucket). |
-| `BACKUP_MAX_RETRIES` | `2` | Minimum `2` enforced: retries after the first failure (each step gets up to `BACKUP_MAX_RETRIES + 1` attempts). |
-
-## S3 object layout
-
-With `BASE_BACKUP_FOLDER=MyAppBackups`, `TIMEZONE=Asia/Karachi`, and run date 18 Apr 2026:
-
-```text
-s3://YOUR_BUCKET/MyAppBackups/2026/04/18/backup-<unixTimestamp>.zip
-```
-
-Example object key: `MyAppBackups/2026/04/18/backup-1713423434.zip`.
-
-S3 has no real folders; `/` is a **key prefix** for organization in the console.
-
-## Backup behavior (CLI)
-
-- **MongoDB**: `mongodump --uri <DATABASE_URL> --archive <file>` (restore with `mongorestore --archive`).
-- **PostgreSQL**: `pg_dump` **custom** format with `--blobs`, `--no-owner`, `--no-acl`; restore with `pg_restore`.
-- **MySQL**: `mysqldump` with `--single-transaction`, `--routines`, `--triggers`, `--events`, and related production-oriented flags; credentials via a temporary `--defaults-extra-file`.
-
-Upload uses **`@aws-sdk/lib-storage`** so the zip is streamed (multipart for larger files) without loading the whole archive into memory.
-
-## Troubleshooting: S3 Access Denied
-
-The SDK returns **Access Denied** when AWS rejects the request. Common causes:
-
-1. **IAM** — The identity needs **multipart** upload actions on the bucket, not only console access.
-2. **Region** — `AWS_REGION` / `AWS_DEFAULT_REGION` must match the **bucket** region.
-3. **Bucket policy** — Deny rules, IP conditions, or required encryption/KMS.
-4. **SSE-KMS** — Bucket default encryption with a CMK may require **`kms:Decrypt`**, **`kms:GenerateDataKey`**, and related permissions on that key.
-
-### Minimal IAM policy (backups **under 5 GiB** — most databases)
+**Minimal policy** (typical DB backups are **under 5 GiB** — one `PutObject` per run):
 
 ```json
 {
@@ -112,70 +114,228 @@ The SDK returns **Access Denied** when AWS rejects the request. Common causes:
       "Sid": "BackupPutObject",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
+      "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
     }
   ]
 }
 ```
 
-### Full policy (multipart — backups **5 GiB or larger**)
+Replace `YOUR_BUCKET_NAME` with your real bucket name.
+
+**If a single backup zip can exceed 5 GiB**, add **multipart** permissions:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "BackupWritesMultipart",
+      "Sid": "BackupMultipartObject",
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
         "s3:AbortMultipartUpload",
         "s3:ListMultipartUploadParts"
       ],
-      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
+      "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
     },
     {
-      "Sid": "BackupListMultipartOnBucket",
+      "Sid": "BackupMultipartListBucket",
       "Effect": "Allow",
       "Action": ["s3:ListBucketMultipartUploads"],
-      "Resource": "arn:aws:s3:::YOUR_BUCKET"
+      "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME"
     }
   ]
 }
 ```
 
-If it still fails, temporarily use a broad policy (e.g. **`AmazonS3FullAccess`**) to confirm the issue is IAM, then tighten.
+Create **access keys** for the IAM user (if you use keys), or rely on the instance **role** / `AWS_PROFILE` on your machine.
 
-Error logs from this app include **bucket**, **key**, and **requestId** when S3 returns an error.
+### 5. Configure environment variables
 
-## Security notes
+```bash
+cp .env.example .env
+```
 
-- Keep `.env` and any credential files out of git (see `.gitignore`).
-- Prefer **IAM roles** on AWS over long-lived keys where possible.
-- Restrict IAM to the bucket (or prefix) you use for backups.
+Edit `.env` with your real values. **Never commit `.env`** (it is listed in `.gitignore`).
 
-## Operational notes
+At minimum set:
 
-- Run **one instance** per backup configuration if you need strictly ordered runs.
-- On failure **after** a zip is produced, the local zip may be **kept** for debugging (see logs).
+- `DATABASE_URL`
+- `S3_BUCKET`
+- `AWS_REGION` **or** `AWS_DEFAULT_REGION`
+- And **either** `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` **or** an IAM role / `AWS_PROFILE` (see [Environment reference](#environment-reference)).
 
-## Project layout
+See [`.env.example`](.env.example) for all variables and comments.
+
+### 6. Build and run
+
+**Production:**
+
+```bash
+npm run build
+npm start
+```
+
+**Development** (TypeScript watch):
+
+```bash
+npm run dev
+```
+
+**Typecheck only:**
+
+```bash
+npm run typecheck
+```
+
+On startup you should see logs for the service, validated `DATABASE_URL`, and the **cron** schedule with the **next run** time (UTC ISO in logs).
+
+---
+
+## Environment reference
+
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `DATABASE_URL` | Connection string; scheme selects MongoDB / PostgreSQL / MySQL (see [examples](#database_url-examples)). |
+| `S3_BUCKET` | Bucket name only (no `s3://` prefix). |
+| `AWS_REGION` or `AWS_DEFAULT_REGION` | Must match the **bucket region**. |
+
+### Credentials (choose one)
+
+The app uses the **AWS SDK default credential provider chain**.
+
+| Variable | When to use |
+|----------|-------------|
+| `AWS_ACCESS_KEY_ID` | With `AWS_SECRET_ACCESS_KEY` for IAM user keys. |
+| `AWS_SECRET_ACCESS_KEY` | Pair with `AWS_ACCESS_KEY_ID`. |
+| `AWS_SESSION_TOKEN` | Temporary credentials (e.g. assumed role). |
+| `AWS_PROFILE` | Named profile in `~/.aws/credentials`. |
+| *(omit keys)* | **EC2 / ECS / Lambda** with an **IAM role** attached. |
+
+### Optional
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BACKUP_TIME` | `02:00` | Daily time `HH:mm` (24h) in `TIMEZONE`. |
+| `TIMEZONE` | `Asia/Karachi` | IANA timezone (used for cron and date segments in the S3 key). |
+| `BASE_BACKUP_FOLDER` | `MyAppBackups` | First segment of the S3 object key. |
+| `KEEP_LOCAL_COPY` | `false` | `true` = keep local zip after upload. |
+| `S3_ENDPOINT` | — | Custom S3 API URL (e.g. LocalStack, MinIO). |
+| `S3_FORCE_PATH_STYLE` | `false` | Often `true` for MinIO / path-style endpoints. |
+| `S3_STORAGE_CLASS` | — | e.g. `STANDARD_IA` (must be valid for the bucket). |
+| `BACKUP_MAX_RETRIES` | `2` | Retries after the first failure; code enforces a **minimum of 2**. |
+
+---
+
+## `DATABASE_URL` examples
+
+**MongoDB (including Atlas):**
+
+```env
+DATABASE_URL=mongodb+srv://user:password@cluster.example.mongodb.net/mydb
+```
+
+**PostgreSQL:**
+
+```env
+DATABASE_URL=postgresql://user:password@db.example.com:5432/mydb
+```
+
+Use `sslmode=require` (or your provider’s SSL query params) in the URL if needed.
+
+**MySQL / MariaDB:**
+
+```env
+DATABASE_URL=mysql://user:password@db.example.com:3306/mydb
+```
+
+The database name must be in the **path** (e.g. `/mydb`). Special characters in the password should be **URL-encoded**.
+
+---
+
+## S3 object layout
+
+Example with `BASE_BACKUP_FOLDER=MyAppBackups`, `TIMEZONE=Asia/Karachi`, date **2026-04-18**:
+
+```text
+s3://YOUR_BUCKET/MyAppBackups/2026/04/18/backup-1713423434.zip
+```
+
+S3 keys use `/` as a **prefix**; there are no real folders.
+
+---
+
+## Backup and restore
+
+| Engine | Backup artifact inside ZIP | Restore (high level) |
+|--------|----------------------------|----------------------|
+| MongoDB | `mongodb.archive` | `mongorestore --uri="..." --archive=...` |
+| PostgreSQL | `postgres.dump` (custom format) | `pg_restore` with connection params |
+| MySQL | `mysql.sql` | `mysql` client / `mysql < backup.sql` |
+
+Download the object from S3, unzip locally, then use the appropriate tool. Always test restores on a **non-production** copy first.
+
+---
+
+## Running in production
+
+- Run **one process** per distinct backup configuration if you need strictly ordered runs.
+- Use a **process manager** or **supervisor** so the Node process restarts on failure (e.g. **systemd**, **PM2**, **Kubernetes**).
+- Prefer **IAM roles** over static access keys on AWS.
+- Ensure the host has a **correct system clock** (NTP) so cron and S3 paths by date behave as expected.
+
+---
+
+## Troubleshooting
+
+### `AccessDenied` / `403` on S3
+
+1. **Region** — `AWS_REGION` must match the bucket’s region.
+2. **Identity** — Confirm which AWS account and principal your credentials use (install [AWS CLI](https://aws.amazon.com/cli/) and run `aws sts get-caller-identity` with the same environment as the app).
+3. **IAM** — For zips **under 5 GiB**, `s3:PutObject` on `arn:aws:s3:::bucket/*` is enough. Larger zips need **multipart** actions (see [IAM policies](#4-create-an-iam-identity-and-policy)).
+4. **Bucket policy / SCP / KMS** — Explicit **Deny**, organization **SCP**, or **KMS key policy** can block writes even with broad IAM.
+5. **Cross-account bucket** — The bucket owner must allow your principal in the **bucket policy**.
+
+Error logs from this service include **bucket**, **object key**, and **requestId** when S3 returns an error.
+
+### `mongodump` / `pg_dump` / `mysqldump` not found
+
+Install the tools and ensure they are on **`PATH`** for the same user that runs `npm start`.
+
+### Windows path / URI issues
+
+The code normalizes CLI paths for Windows where needed; if a tool still fails, check the tool’s stderr in logs.
+
+---
+
+## Security
+
+- Do **not** commit `.env`, database passwords, or AWS keys.
+- Use **least-privilege** IAM (ideally only `s3:PutObject` on your backup prefix).
+- Restrict **S3 bucket policies**; avoid public **write**; be careful with public **read** on backup buckets.
+- Rotate credentials if they are ever exposed.
+
+---
+
+## Project structure
 
 ```text
 src/
-  index.ts              # Entrypoint, signals, loads config
-  scheduler.ts          # node-cron wiring + next-run logging
-  config.ts             # Env loading / validation helpers
+  index.ts              # Entry point
+  scheduler.ts          # Cron schedule
+  config.ts             # Environment loading
   backup/
-    detectDb.ts
+    detectDb.ts         # URL → engine
     mongoBackup.ts
     postgresBackup.ts
     mysqlBackup.ts
-    runBackup.ts        # Temp dirs, zip, cleanup
+    runBackup.ts        # Dump + zip + temp cleanup
   s3/
-    upload.ts           # S3 client, key builder, streaming upload
+    upload.ts           # S3 client + PutObject / multipart upload
   services/
-    backupJob.ts        # End-to-end job with retries
+    backupJob.ts        # Orchestration + retries
   utils/
     cliPaths.ts
     cronFromTime.ts
@@ -187,6 +347,14 @@ src/
     zipStream.ts
 ```
 
+---
+
+## Contributing
+
+Issues and pull requests are welcome. Please keep changes focused and match existing TypeScript style.
+
+---
+
 ## License
 
-MIT
+[MIT](LICENSE)
