@@ -1,7 +1,7 @@
 {
   "name": "snapdump",
   "version": "1.0.0",
-  "description": "Production database backups to AWS S3 (MongoDB, PostgreSQL, MySQL)",
+  "description": "Snapdump — scheduled DB backups (mongodump, pg_dump, mysqldump) to AWS S3",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

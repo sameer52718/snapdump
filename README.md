@@ -1,4 +1,4 @@
-# Database Backup Service
+# Snapdump
 
 Automated **daily database backups** for **MongoDB**, **PostgreSQL**, and **MySQL**. The service detects the engine from `DATABASE_URL`, runs the official CLI tools (`mongodump`, `pg_dump`, `mysqldump`), compresses the result into a **ZIP** (streaming, low memory), and uploads to **Amazon S3** with retries and structured logging.
 
@@ -73,8 +73,8 @@ The process stays alive and runs **once per day** at `BACKUP_TIME` in `TIMEZONE`
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/database-backup-script.git
-cd database-backup-script
+git clone https://github.com/sameer52718/snapdump.git
+cd snapdump
 npm install
 ```
 
